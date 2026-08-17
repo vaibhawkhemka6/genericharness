@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "HealthHarness",
-  description: "HealthHarness agent test chat",
+  title: "GenericHarness",
+  description: "GenericHarness agent test chat",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

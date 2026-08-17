@@ -1,4 +1,4 @@
-// Streaming client for the HealthHarness backend's SSE /chat endpoint.
+// Streaming client for the GenericHarness backend's SSE /chat endpoint.
 // Parses the raw "event: <type>\ndata: <json>\n\n" SSE wire format by hand
 // (fetch + ReadableStream) since native EventSource doesn't support POST bodies.
 

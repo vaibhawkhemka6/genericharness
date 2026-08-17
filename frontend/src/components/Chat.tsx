@@ -136,7 +136,7 @@ export default function Chat() {
     <div className="flex flex-col h-screen max-w-3xl mx-auto">
       <header className="flex items-center justify-between px-4 py-3 border-b border-neutral-200">
         <h1 className="text-sm font-semibold text-neutral-800">
-          HealthHarness — Agent Test Chat
+          GenericHarness — Agent Test Chat
         </h1>
         <button
           type="button"

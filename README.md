@@ -1,4 +1,4 @@
-# HealthHarness — Phase 1
+# GenericHarness — Phase 1
 
 A from-scratch agent harness inspired by [Agno](https://github.com/agno-agi/agno)'s architecture:
 a provider-agnostic `Agent` core loop (build context → call model → run tools → respond),
