@@ -2,14 +2,12 @@
 internal types and the `anthropic` SDK, mirroring
 `agno/models/anthropic/claude.py`.
 
-Same shape as `models/openai/chat.py` (a translation layer, not the full
-provider `Model` dataclass - no client construction, streaming, or
-retry/error-classification plumbing yet), plus `invoke()`: Anthropic's
-request needs the `(chat_messages, system)` tuple `format_messages()`
-produces threaded through to `client.messages.create()`, so building the
-request and calling the API belongs here rather than being left to a caller.
+Same shape as `models/openai/chat.py`: module-level functions doing the
+translation, plus a free `invoke()` that threads the `(chat_messages,
+system)` tuple `format_messages()` produces through to
+`client.messages.create()` given an explicit `client`/`model_id`.
 
-    invoke()                  build the request, call the API, parse the result
+    invoke()                  build the request, call the API, parse the result (explicit client)
     parse_provider_response() Anthropic's Message -> our ModelResponse (text blocks only)
     get_metrics()              Anthropic's Usage -> our MessageMetrics
 
@@ -20,11 +18,23 @@ container/file-id bookkeeping. `get_metrics` only maps input/output/total
 tokens - cache read/write token accounting is dropped for the same reason
 as the OpenAI adapter: `MessageMetrics` (metrics.py) has nowhere to put it
 yet.
+
+`Claude` (below the free functions) is the Stage 2 addition: a `Model`
+(`models/base.py`) subclass that owns its own client instead of taking one
+as a parameter - `.invoke(messages, assistant_message, tools)` builds the
+client from `self.api_key`, calls `format_messages()`/`parse_provider_response()`
+itself, and populates the assistant message via
+`Model._populate_assistant_message()`. It doesn't replace the free
+`invoke()` function above (kept as-is - unused internally, but harmless to
+keep as a lower-level building block) or any of `format_messages()`/
+`parse_provider_response()`/`get_metrics()`, which `stage0_anthropic.py`
+still calls directly by hand.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from anthropic import Anthropic
@@ -33,6 +43,7 @@ from anthropic.types import Usage
 
 from app.exceptions import ModelProviderError
 from app.metrics import MessageMetrics, Timer
+from app.models.base import Model
 from app.models.message import Message
 from app.models.response import ModelResponse
 from app.utils.models.claude import format_messages
@@ -122,3 +133,50 @@ def get_metrics(response_usage: Usage) -> MessageMetrics:
     metrics.total_tokens = metrics.input_tokens + metrics.output_tokens
 
     return metrics
+
+
+@dataclass
+class Claude(Model):
+    """`Model` subclass for Anthropic's Messages API."""
+
+    id: str = "claude-sonnet-4-5-20250929"
+    provider: str = "Anthropic"
+    max_tokens: int = 4096
+
+    def get_client(self) -> Anthropic:
+        return Anthropic(api_key=self.api_key) if self.api_key else Anthropic()
+
+    def invoke(
+        self,
+        messages: List[Message],
+        assistant_message: Message,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> ModelResponse:
+        """One synchronous round-trip: format `messages` into Anthropic's
+        `(chat_messages, system)` shape, call the SDK, time it onto
+        `assistant_message.metrics.duration`, parse the response, and write
+        it onto `assistant_message`."""
+        chat_messages, system_message = format_messages(messages)
+
+        request_kwargs: Dict[str, Any] = {"max_tokens": self.max_tokens}
+        if system_message:
+            request_kwargs["system"] = system_message
+        if tools:
+            request_kwargs["tools"] = tools
+
+        timer = Timer()
+        try:
+            timer.start()
+            response = self.get_client().messages.create(
+                model=self.id,
+                messages=chat_messages,  # type: ignore[arg-type]
+                **request_kwargs,
+            )
+            timer.stop()
+        except Exception as e:
+            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e
+
+        assistant_message.metrics.duration = timer.elapsed
+
+        model_response = parse_provider_response(response)
+        return self._populate_assistant_message(assistant_message, model_response)
