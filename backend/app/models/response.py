@@ -13,6 +13,12 @@ returned, whether it errored); `ModelResponse` is what a provider adapter
 hands back to the agent loop for a single model call - the raw tool_calls
 plus already-executed ToolExecutions accumulate as the loop works through
 one iteration.
+
+`ToolExecution.metrics` is `ToolCallMetrics` (`metrics.py`), not
+`MessageMetrics` - a tool call has no token counts, only a duration, and
+`tools/function.py:FunctionCall.execute()` is the one thing that
+constructs a `ToolExecution`, timing the call with `ToolCallMetrics`
+directly rather than a bare `Timer` + hand-assigned `.duration`.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from dataclasses import asdict, dataclass, field
 from time import time
 from typing import Any, Dict, List, Optional
 
-from app.metrics import MessageMetrics
+from app.metrics import MessageMetrics, ToolCallMetrics
 
 
 @dataclass
@@ -33,7 +39,7 @@ class ToolExecution:
     tool_args: Optional[Dict[str, Any]] = None
     tool_call_error: Optional[bool] = None
     result: Optional[str] = None
-    metrics: Optional[MessageMetrics] = None
+    metrics: Optional[ToolCallMetrics] = None
 
     # If True, the agent stops executing after this tool call.
     stop_after_tool_call: bool = False
@@ -57,7 +63,7 @@ class ToolExecution:
             tool_call_error=data.get("tool_call_error"),
             result=data.get("result"),
             stop_after_tool_call=data.get("stop_after_tool_call", False),
-            metrics=MessageMetrics.from_dict(metrics) if metrics else None,
+            metrics=ToolCallMetrics.from_dict(metrics) if metrics else None,
             **({"created_at": data["created_at"]} if "created_at" in data else {}),
         )
 

@@ -17,7 +17,7 @@ session-level rollup, tests - instead of living in one place.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from time import perf_counter
+from time import perf_counter, time
 from typing import Any, Dict, Optional
 
 
@@ -47,6 +47,52 @@ class Timer:
         if self.start_time is not None:
             return perf_counter() - self.start_time
         return 0.0
+
+
+@dataclass
+class ToolCallMetrics:
+    """Timing for a single tool call, mirroring Agno's `ToolCallMetrics`
+    (`metrics.py:115`) - unlike `MessageMetrics`, a tool call has no token
+    counts of its own, only how long it took to run. Kept as its own type
+    rather than reusing `MessageMetrics` with zeroed token fields: a tool
+    call's `Timer` starts/stops independently of any model call, and
+    `ToolExecution.metrics` (`models/response.py`) should say "this ran for
+    N seconds" without implying "this consumed tokens."
+    """
+
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    duration: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self._timer = Timer()
+
+    def start_timer(self) -> None:
+        self._timer.start()
+        if self.start_time is None:
+            self.start_time = time()
+
+    def stop_timer(self, set_duration: bool = True) -> None:
+        self._timer.stop()
+        if set_duration:
+            self.duration = self._timer.elapsed
+        if self.end_time is None:
+            self.end_time = time()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "duration": self.duration,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolCallMetrics":
+        return cls(
+            start_time=data.get("start_time"),
+            end_time=data.get("end_time"),
+            duration=data.get("duration"),
+        )
 
 
 @dataclass
