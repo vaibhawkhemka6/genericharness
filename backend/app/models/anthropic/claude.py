@@ -29,6 +29,15 @@ itself, and populates the assistant message via
 keep as a lower-level building block) or any of `format_messages()`/
 `parse_provider_response()`/`get_metrics()`, which `stage0_anthropic.py`
 still calls directly by hand.
+
+Stage 3: `Model.response()` (`models/base.py`) always builds and passes
+tool declarations in the OpenAI-shaped *canonical* form
+(`utils/models/openai.py:format_tools_for_model`) - it doesn't know or care
+which provider it's talking to. `Claude.invoke()` is where that gets
+converted to Anthropic's `input_schema` shape, via this module's own
+`format_tools_for_model()`, right before the request is built - keeping
+that conversion inside the provider adapter, not `response()`, is what lets
+`response()` stay provider-agnostic.
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ from app.models.base import Model
 from app.models.message import Message
 from app.models.response import ModelResponse
 from app.utils.models.claude import format_messages
+from app.utils.models.claude import format_tools_for_model as format_tools_for_claude
 
 
 def invoke(
@@ -153,16 +163,24 @@ class Claude(Model):
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> ModelResponse:
         """One synchronous round-trip: format `messages` into Anthropic's
-        `(chat_messages, system)` shape, call the SDK, time it onto
-        `assistant_message.metrics.duration`, parse the response, and write
-        it onto `assistant_message`."""
+        `(chat_messages, system)` shape, convert `tools` from the OpenAI-
+        shaped canonical form into Anthropic's `input_schema` shape, call
+        the SDK, time it onto `assistant_message.metrics.duration`, parse
+        the response, and write it onto `assistant_message`.
+
+        `tools` arrives OpenAI-shaped (`{"type": "function", "function":
+        {...}}`) regardless of caller - `Model.response()` builds it once,
+        the same way, for every provider (see `models/base.py`'s
+        docstring) - so it's converted here, not by the caller.
+        """
         chat_messages, system_message = format_messages(messages)
+        anthropic_tools = format_tools_for_claude(tools) if tools else None
 
         request_kwargs: Dict[str, Any] = {"max_tokens": self.max_tokens}
         if system_message:
             request_kwargs["system"] = system_message
-        if tools:
-            request_kwargs["tools"] = tools
+        if anthropic_tools:
+            request_kwargs["tools"] = anthropic_tools
 
         timer = Timer()
         try:
@@ -179,4 +197,5 @@ class Claude(Model):
         assistant_message.metrics.duration = timer.elapsed
 
         model_response = parse_provider_response(response)
-        return self._populate_assistant_message(assistant_message, model_response)
+        self._populate_assistant_message(assistant_message, model_response)
+        return model_response

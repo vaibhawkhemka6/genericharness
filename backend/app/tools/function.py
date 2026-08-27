@@ -16,6 +16,15 @@ this stage doesn't have yet. `execute()` also returns this project's own
 `FunctionExecutionResult` type - one record type for "the outcome of a
 tool call" is enough until something besides the agent loop needs to see a
 different shape of it.
+
+Stage 3 addition: `execute()` used to catch every exception the entrypoint
+raised, including this project's own control-flow exceptions
+(`AgentRunException`/`RetryAgentRun`/`StopAgentRun`/`RunCancelledException`,
+`app/exceptions.py`) - which meant a tool raising `StopAgentRun(...)` to
+signal "end the run here" got silently flattened into an ordinary failed
+`ToolExecution`, indistinguishable from a real bug. Those are now re-raised
+before the generic `except Exception`, so `models/base.py`'s agent loop
+(`run_function_call()`) can catch and route them instead.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from typing import Any, Callable, Dict, Optional, get_type_hints
 from docstring_parser import parse as parse_docstring
 from pydantic import BaseModel, ConfigDict
 
+from app.exceptions import AgentRunException, RunCancelledException
 from app.metrics import ToolCallMetrics
 from app.models.response import ToolExecution
 from app.utils.json_schema import get_json_schema
@@ -154,8 +164,16 @@ class FunctionCall(BaseModel):
 
     def execute(self) -> ToolExecution:
         """Run the entrypoint and return the outcome as a `ToolExecution` -
-        never raises; a failing tool is a failed `ToolExecution`, not an
-        exception the agent loop has to catch."""
+        for an *ordinary* failure (the entrypoint raises something other
+        than this project's control-flow exceptions), that's a failed
+        `ToolExecution`, not an exception the agent loop has to catch.
+
+        `AgentRunException` (and its `RetryAgentRun`/`StopAgentRun`
+        subclasses) and `RunCancelledException` are the exception: those
+        are re-raised rather than swallowed, since a tool raises them
+        *deliberately* to signal the agent loop, not by accident - see
+        `app/exceptions.py` and `models/base.py:Model.run_function_call()`.
+        """
         if self.error is not None:
             return ToolExecution(
                 tool_call_id=self.call_id,
@@ -183,6 +201,11 @@ class FunctionCall(BaseModel):
             self.result = self.function.entrypoint(**(self.arguments or {}))
             result_str = self.result if isinstance(self.result, str) else json.dumps(self.result, default=str)
             tool_call_error = False
+        except (AgentRunException, RunCancelledException):
+            # Deliberate control flow from the tool, not a failure to report
+            # back as a ToolExecution - let it propagate to run_function_call().
+            metrics.stop_timer()
+            raise
         except Exception as e:
             logger.warning(f"Error running tool {self.get_call_str()}: {e}")
             result_str = str(e)

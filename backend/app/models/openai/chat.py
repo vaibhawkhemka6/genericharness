@@ -152,4 +152,5 @@ class OpenAIChat(Model):
         assistant_message.metrics.duration = timer.elapsed
 
         model_response = parse_provider_response(response, model_name=self.name, model_id=self.id)
-        return self._populate_assistant_message(assistant_message, model_response)
+        self._populate_assistant_message(assistant_message, model_response)
+        return model_response
