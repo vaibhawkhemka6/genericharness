@@ -61,6 +61,12 @@ class Message(BaseModel):
     # Set when this message was fetched from history rather than produced
     # fresh in the current run.
     from_history: bool = False
+    # Stage 3 Half B addition: whether this message should be reported back
+    # on RunOutput.messages / eventually persisted to session history
+    # (app/agent/_response.py:update_run_response filters on this).
+    # Defaults True - nothing in this project sets it False yet, but the
+    # field has to exist before that filter can mean anything.
+    add_to_agent_memory: bool = True
 
     # Usage/timing for this message. Empty MessageMetrics by default;
     # populated on assistant messages once the model responds.
@@ -97,6 +103,7 @@ class Message(BaseModel):
             "tool_call_error": self.tool_call_error,
             "stop_after_tool_call": self.stop_after_tool_call,
             "from_history": self.from_history,
+            "add_to_agent_memory": self.add_to_agent_memory,
         }
         message_dict = {
             k: v
