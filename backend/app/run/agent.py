@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from time import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -176,3 +177,171 @@ class RunOutput:
             **({"status": status} if status is not None else {}),
             **filtered_data,
         )
+
+
+# --- Stage 4 addition: the CONSUMER-facing event vocabulary -----------------
+#
+# `agent/_response.py:handle_model_response_stream()` is the one place that
+# builds these - it watches `Model.response_stream()`'s `ModelResponse`
+# deltas (`models/base.py`) and translates each into exactly one of the
+# dataclasses below, which is what `Agent.run(stream=True)` actually yields
+# to a caller. Same envelope-plus-marker trick as `ModelResponse.event`
+# (`models/response.py`) one layer down: every event dataclass shares
+# `BaseAgentRunEvent`'s envelope fields (who/when) plus its own `event`
+# discriminator string, so a caller iterating the stream can dispatch on
+# `.event` alone without isinstance-checking each subclass.
+#
+# Trimmed against real Agno's `agno/run/agent.py` `RunEvent`/event-class
+# set: this project builds only the events `response_stream()` actually has
+# a reason to emit - a content delta, the run's final result, a model
+# call's start/end, and one tool call's start/end. Left out entirely (per
+# this stage's explicit skip-for-lean list): run_paused/run_continued
+# (HITL - not built), pre_hook_*/post_hook_* (hooks - not built),
+# reasoning_* (reasoning - not built), memory_update_*/session_summary_*
+# (memory/session-summary - not built), parser_model_response_*/
+# output_model_response_* (parser/output model - not built), compression_*
+# (CompressionManager - not built), followups_* (followups - not built),
+# tool_call_error (no HITL/error surfacing built for tool calls yet),
+# custom_event (no custom-event escape hatch built).
+
+
+class RunEvent(str, Enum):
+    """Event-type vocabulary for `Agent.run(stream=True)`'s output."""
+
+    run_started = "RunStarted"
+    run_content = "RunContent"
+    run_completed = "RunCompleted"
+    run_error = "RunError"
+    run_cancelled = "RunCancelled"
+
+    model_request_started = "ModelRequestStarted"
+    model_request_completed = "ModelRequestCompleted"
+
+    tool_call_started = "ToolCallStarted"
+    tool_call_completed = "ToolCallCompleted"
+
+
+@dataclass
+class BaseAgentRunEvent:
+    """Envelope fields every event below carries - who (`agent_id`/
+    `agent_name`/`run_id`/`session_id`) and when (`created_at`), plus
+    `event` itself, the field a consumer dispatches on."""
+
+    event: str = ""
+    created_at: int = field(default_factory=lambda: int(time()))
+    agent_id: Optional[str] = None
+    agent_name: Optional[str] = None
+    run_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+@dataclass
+class RunStartedEvent(BaseAgentRunEvent):
+    """Sent once, before the first model call of a run."""
+
+    event: str = RunEvent.run_started.value
+    model: Optional[str] = None
+    model_provider: Optional[str] = None
+
+
+@dataclass
+class RunContentEvent(BaseAgentRunEvent):
+    """One content delta - the agent-layer sibling of a plain-text
+    `ModelResponse` chunk (`event=None` at the model layer, matching
+    `RunEvent.run_content` up here)."""
+
+    event: str = RunEvent.run_content.value
+    content: Optional[Any] = None
+    content_type: str = "str"
+
+
+@dataclass
+class RunCompletedEvent(BaseAgentRunEvent):
+    """Sent once, after the run's loop has fully exited - the streaming
+    sibling of a non-streaming `Agent.run()`'s returned `RunOutput`."""
+
+    event: str = RunEvent.run_completed.value
+    content: Optional[Any] = None
+    content_type: str = "str"
+    metrics: Optional[RunMetrics] = None
+
+
+@dataclass
+class RunErrorEvent(BaseAgentRunEvent):
+    """Sent instead of `RunCompletedEvent` if the model call raised
+    `ModelProviderError` - the streaming sibling of `_run.py:run()`'s
+    `except ModelProviderError` branch."""
+
+    event: str = RunEvent.run_error.value
+    content: Optional[str] = None
+
+
+@dataclass
+class RunCancelledEvent(BaseAgentRunEvent):
+    """Sent instead of `RunCompletedEvent` if a tool raised
+    `RunCancelledException` mid-stream - the streaming sibling of
+    `_run.py:run()`'s `except RunCancelledException` branch."""
+
+    event: str = RunEvent.run_cancelled.value
+    content: Optional[str] = None
+
+
+@dataclass
+class ModelRequestStartedEvent(BaseAgentRunEvent):
+    """One per `response_stream()` iteration, sent before that iteration's
+    `invoke_stream()` sub-loop starts - the agent-layer translation of the
+    model layer's `ModelResponseEvent.model_request_started`."""
+
+    event: str = RunEvent.model_request_started.value
+    model: Optional[str] = None
+    model_provider: Optional[str] = None
+
+
+@dataclass
+class ModelRequestCompletedEvent(BaseAgentRunEvent):
+    """One per `response_stream()` iteration, sent after that iteration's
+    assistant message is fully accumulated - the agent-layer translation of
+    `ModelResponseEvent.model_request_completed`, carrying that iteration's
+    token counts/TTFT straight across."""
+
+    event: str = RunEvent.model_request_completed.value
+    model: Optional[str] = None
+    model_provider: Optional[str] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    time_to_first_token: Optional[float] = None
+
+
+@dataclass
+class ToolCallStartedEvent(BaseAgentRunEvent):
+    """Sent right before a tool call executes - `tool` is a partial
+    `ToolExecution` (id/name/args set, `result`/`metrics` still None), the
+    agent-layer translation of `ModelResponseEvent.tool_call_started`."""
+
+    event: str = RunEvent.tool_call_started.value
+    tool: Optional[ToolExecution] = None
+
+
+@dataclass
+class ToolCallCompletedEvent(BaseAgentRunEvent):
+    """Sent right after a tool call executes - `tool` is the same
+    `ToolExecution` object, now finished (`result`/`metrics` set), the
+    agent-layer translation of `ModelResponseEvent.tool_call_completed`."""
+
+    event: str = RunEvent.tool_call_completed.value
+    tool: Optional[ToolExecution] = None
+
+
+# What Agent.run(stream=True) yields, one instance at a time.
+RunOutputEvent = Union[
+    RunStartedEvent,
+    RunContentEvent,
+    RunCompletedEvent,
+    RunErrorEvent,
+    RunCancelledEvent,
+    ModelRequestStartedEvent,
+    ModelRequestCompletedEvent,
+    ToolCallStartedEvent,
+    ToolCallCompletedEvent,
+]

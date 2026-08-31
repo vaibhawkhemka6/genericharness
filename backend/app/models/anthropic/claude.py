@@ -38,13 +38,29 @@ converted to Anthropic's `input_schema` shape, via this module's own
 `format_tools_for_model()`, right before the request is built - keeping
 that conversion inside the provider adapter, not `response()`, is what lets
 `response()` stay provider-agnostic.
+
+Stage 4 addition - `invoke_stream()` and `parse_provider_response_delta()`,
+the streaming TRANSPORT layer for this provider. Notably simpler than
+OpenAI's on the tool-call side, for one specific reason: this uses the
+`anthropic` SDK's *high-level* `client.messages.stream(...)` context
+manager (not the raw `stream=True` event union) - it accumulates each
+content block for you internally, so the event this module reads for a
+`tool_use` block, `content_block_stop`, already carries the fully-formed
+block (`.content_block.input` is a complete parsed dict, not a partial JSON
+string fragment). OpenAI's chunks carry raw argument-string *fragments*
+addressed by index, needing `OpenAIChat.parse_tool_calls()`'s explicit
+by-index merge (Phase B); here, each `content_block_stop` for a `tool_use`
+block already IS one complete tool call - `parse_provider_response_delta()`
+below yields it as a finished dict in one shot, and `Model.parse_tool_calls()`'s
+no-op default (`models/base.py`) is all `Claude` needs - there is nothing
+left for Phase B to reassemble.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from anthropic import Anthropic
 from anthropic.types import Message as AnthropicMessage
@@ -145,6 +161,63 @@ def get_metrics(response_usage: Usage) -> MessageMetrics:
     return metrics
 
 
+def parse_provider_response_delta(event: Any) -> ModelResponse:
+    """Parse one event from `client.messages.stream(...)`'s high-level
+    iterator into a `ModelResponse` delta - the streaming sibling of
+    `parse_provider_response()` above.
+
+    Only three of the SDK's accumulated event types carry anything this
+    project's trimmed `ModelResponse`/`MessageMetrics` have a field for
+    (duck-typed on `.type` rather than imported event classes - the SDK's
+    accumulated types live under a private `anthropic.lib.streaming`
+    submodule):
+
+      - `content_block_delta` with `delta.type == "text_delta"` - a plain
+        text fragment (`delta.text`).
+      - `content_block_stop` where the now-complete `content_block.type ==
+        "tool_use"` - see this module's docstring for why this is already
+        one whole, mergeable-with-nothing tool call, unlike OpenAI's
+        fragments.
+      - `message_stop` - carries the final accumulated `message.usage` for
+        the whole turn (Anthropic reports usage once, at the end, not per
+        chunk the way OpenAI's trailing chunk does).
+
+    Every other event type (`message_start`, `content_block_start`, the
+    `input_json_delta` deltas that fire *while* a tool_use block is still
+    being accumulated, `message_delta`) produces an empty `ModelResponse` -
+    nothing on it is set, so `_populate_stream_data()`
+    (`models/base.py`, Phase A) sees no reason to yield it upward.
+    """
+    model_response = ModelResponse()
+    event_type = getattr(event, "type", None)
+
+    if event_type == "content_block_delta":
+        delta = event.delta
+        if getattr(delta, "type", None) == "text_delta":
+            model_response.content = delta.text
+
+    elif event_type == "content_block_stop":
+        block = event.content_block
+        if getattr(block, "type", None) == "tool_use":
+            function_def: Dict[str, Any] = {"name": block.name}
+            if block.input:
+                function_def["arguments"] = json.dumps(block.input)
+            model_response.tool_calls = [
+                {
+                    "id": block.id,
+                    "type": "function",
+                    "function": function_def,
+                }
+            ]
+
+    elif event_type == "message_stop":
+        message = getattr(event, "message", None)
+        if message is not None and message.usage is not None:
+            model_response.response_usage = get_metrics(message.usage)
+
+    return model_response
+
+
 @dataclass
 class Claude(Model):
     """`Model` subclass for Anthropic's Messages API."""
@@ -199,3 +272,49 @@ class Claude(Model):
         model_response = parse_provider_response(response)
         self._populate_assistant_message(assistant_message, model_response)
         return model_response
+
+    def invoke_stream(
+        self,
+        messages: List[Message],
+        assistant_message: Message,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Iterator[ModelResponse]:
+        """The TRANSPORT layer for streaming: open a
+        `client.messages.stream(...)` context manager and `yield` one
+        `ModelResponse` delta per accumulated SDK event, via
+        `parse_provider_response_delta()`.
+
+        Same request-building as `invoke()` above (format messages/tools,
+        pass `max_tokens`/`system`/`tools`) - only the call itself differs,
+        swapping `messages.create()` for the high-level `messages.stream()`
+        context manager (see this module's docstring for why that specific
+        SDK entry point matters: it's what makes tool_use blocks arrive
+        already-complete at `content_block_stop`, sparing this provider the
+        by-index fragment merge `OpenAIChat.parse_tool_calls()` needs).
+
+        Does not call `_populate_assistant_message()` itself - each yielded
+        `ModelResponse` is one fragment of the eventual response, not a
+        finished one; `_populate_stream_data()` (`models/base.py`, Phase A)
+        is what accumulates these, and `_populate_assistant_message_from_stream_data()`
+        (Phase B) is what eventually writes the accumulated result onto
+        `assistant_message`.
+        """
+        chat_messages, system_message = format_messages(messages)
+        anthropic_tools = format_tools_for_claude(tools) if tools else None
+
+        request_kwargs: Dict[str, Any] = {"max_tokens": self.max_tokens}
+        if system_message:
+            request_kwargs["system"] = system_message
+        if anthropic_tools:
+            request_kwargs["tools"] = anthropic_tools
+
+        try:
+            with self.get_client().messages.stream(
+                model=self.id,
+                messages=chat_messages,  # type: ignore[arg-type]
+                **request_kwargs,
+            ) as stream:
+                for event in stream:
+                    yield parse_provider_response_delta(event)
+        except Exception as e:
+            raise ModelProviderError(message=str(e), model_name=self.name, model_id=self.id) from e

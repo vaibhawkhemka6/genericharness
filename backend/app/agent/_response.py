@@ -10,11 +10,26 @@ and message list and check `RunOutput` comes out right.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional
+
 from app.metrics import RunMetrics
-from app.models.response import ModelResponse
-from app.run.agent import RunOutput
+from app.models.response import ModelResponse, ModelResponseEvent, ToolExecution
+from app.run.agent import (
+    ModelRequestCompletedEvent,
+    ModelRequestStartedEvent,
+    RunCompletedEvent,
+    RunContentEvent,
+    RunOutput,
+    RunOutputEvent,
+    ToolCallCompletedEvent,
+    ToolCallStartedEvent,
+)
 from app.run.base import RunStatus
 from app.run.messages import RunMessages
+
+if TYPE_CHECKING:
+    from app.agent.agent import Agent
+    from app.tools.function import Function
 
 
 def update_run_response(
@@ -74,3 +89,117 @@ def update_run_response(
     run_output.metrics = run_metrics
 
     return run_output
+
+
+def handle_model_response_stream(
+    agent: "Agent",
+    run_output: RunOutput,
+    run_messages: RunMessages,
+    functions: Optional[Dict[str, "Function"]] = None,
+) -> Iterator[RunOutputEvent]:
+    """CONSUMER layer for streaming - the streaming sibling of
+    `update_run_response()` above. Watches `agent.model.response_stream()`'s
+    `ModelResponse` deltas one at a time and translates each into exactly
+    one agent-level `RunOutputEvent` (`run/agent.py`) - same envelope-plus-
+    marker dispatch the model layer itself uses (`ModelResponse.event`),
+    one layer up.
+
+    `response_stream()` (`models/base.py`) already mutates
+    `run_messages.messages` in place as it goes, the same way `response()`
+    does for the non-streaming path - so once the loop below ends, this
+    function is in exactly the position `_run.py:run()` is in after its own
+    `agent.model.response(...)` call returns, and can finish the same way:
+    build one synthetic `ModelResponse` (accumulated content + collected
+    `ToolExecution`s) and hand it to `update_run_response()` to do the one
+    real reconstruction pass (StopAgentRun-empty-content fallback, token
+    totals, `RunStatus.completed`) - no separate copy of that logic lives
+    here.
+    """
+    accumulated_content = ""
+    tool_executions: List[ToolExecution] = []
+
+    for model_response_delta in agent.model.response_stream(
+        messages=run_messages.messages,
+        functions=functions,
+        tool_call_limit=agent.tool_call_limit,
+    ):
+        if model_response_delta.event == ModelResponseEvent.model_request_started.value:
+            yield ModelRequestStartedEvent(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                run_id=run_output.run_id,
+                session_id=run_output.session_id,
+                model=agent.model.id,
+                model_provider=agent.model.get_provider(),
+            )
+            continue
+
+        if model_response_delta.event == ModelResponseEvent.model_request_completed.value:
+            yield ModelRequestCompletedEvent(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                run_id=run_output.run_id,
+                session_id=run_output.session_id,
+                model=agent.model.id,
+                model_provider=agent.model.get_provider(),
+                input_tokens=model_response_delta.input_tokens,
+                output_tokens=model_response_delta.output_tokens,
+                total_tokens=model_response_delta.total_tokens,
+                time_to_first_token=model_response_delta.time_to_first_token,
+            )
+            continue
+
+        if model_response_delta.event == ModelResponseEvent.tool_call_started.value:
+            tool_execution = (model_response_delta.tool_executions or [None])[0]
+            yield ToolCallStartedEvent(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                run_id=run_output.run_id,
+                session_id=run_output.session_id,
+                tool=tool_execution,
+            )
+            continue
+
+        if model_response_delta.event == ModelResponseEvent.tool_call_completed.value:
+            tool_execution = (model_response_delta.tool_executions or [None])[0]
+            if tool_execution is not None:
+                tool_executions.append(tool_execution)
+            yield ToolCallCompletedEvent(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                run_id=run_output.run_id,
+                session_id=run_output.session_id,
+                tool=tool_execution,
+            )
+            continue
+
+        # event is None here: a plain content delta (see ModelResponse's
+        # envelope-plus-marker docstring in models/response.py). The raw
+        # tool-call JSON fragments Phase A (_populate_stream_data) collects
+        # never surface as their own event up here - a fragment-only delta
+        # has no .content, so it simply falls through this branch unyielded.
+        if model_response_delta.content:
+            accumulated_content += model_response_delta.content
+            yield RunContentEvent(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                run_id=run_output.run_id,
+                session_id=run_output.session_id,
+                content=model_response_delta.content,
+            )
+
+    final_model_response = ModelResponse(
+        content=accumulated_content or None,
+        tool_executions=tool_executions or None,
+    )
+    update_run_response(run_output=run_output, model_response=final_model_response, run_messages=run_messages)
+
+    yield RunCompletedEvent(
+        agent_id=agent.id,
+        agent_name=agent.name,
+        run_id=run_output.run_id,
+        session_id=run_output.session_id,
+        content=run_output.content,
+        content_type=run_output.content_type,
+        metrics=run_output.metrics,
+    )

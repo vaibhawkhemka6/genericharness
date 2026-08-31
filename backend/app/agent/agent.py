@@ -30,7 +30,7 @@ can't import `_run.py` back at module level too.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
 from uuid import uuid4
 
 from app.models.base import Model
@@ -39,7 +39,7 @@ from app.tools.function import Function
 from app.tools.toolkit import Toolkit
 
 if TYPE_CHECKING:
-    from app.run.agent import RunOutput
+    from app.run.agent import RunOutput, RunOutputEvent
 
 
 @dataclass
@@ -79,7 +79,22 @@ class Agent:
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         session_history: Optional[List[Message]] = None,
-    ) -> "RunOutput":
+        stream: bool = False,
+    ) -> Union["RunOutput", Iterator["RunOutputEvent"]]:
+        """Two-line dispatch, same as the module docstring describes - the
+        only new piece this stage adds is `stream`: `False` (default) still
+        goes to `_run.run()` and blocks for one `RunOutput`; `True` goes to
+        `_run.run_stream()` instead and returns a generator of
+        `RunOutputEvent`s the caller iterates as the model streams. Which
+        one actually runs is decided here, once, rather than `_run.py`
+        having two public entry points a caller has to choose between
+        directly.
+        """
+        if stream:
+            from app.agent._run import run_stream as _run_stream
+
+            return _run_stream(self, input, session_id=session_id, user_id=user_id, session_history=session_history)
+
         from app.agent._run import run as _run
 
         return _run(self, input, session_id=session_id, user_id=user_id, session_history=session_history)

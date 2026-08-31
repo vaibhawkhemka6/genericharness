@@ -16,18 +16,18 @@ Half A and Half B together.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, Iterator, List, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from app.agent._messages import get_run_messages
-from app.agent._response import update_run_response
+from app.agent._response import handle_model_response_stream, update_run_response
 from app.agent.agent import Agent
 from app.exceptions import ModelProviderError, RunCancelledException
 from app.metrics import Timer
 from app.models.message import Message
-from app.run.agent import RunInput, RunOutput
+from app.run.agent import RunCancelledEvent, RunErrorEvent, RunInput, RunOutput, RunOutputEvent, RunStartedEvent
 from app.run.base import RunStatus
 from app.tools.function import Function
 from app.tools.toolkit import Toolkit
@@ -127,3 +127,107 @@ def run(
     if run_output.metrics is not None:
         run_output.metrics.duration = timer.elapsed
     return run_output
+
+
+def run_stream(
+    agent: Agent,
+    input: Union[str, List, Dict, Message, BaseModel, List[Message]],
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    session_history: Optional[List[Message]] = None,
+) -> Iterator[RunOutputEvent]:
+    """Streaming twin of `run()` above - identical setup (resolve tools,
+    assemble messages, build the `RunOutput` shell), but instead of making
+    one blocking `agent.model.response(...)` call and returning once,
+    `yield`s from `handle_model_response_stream()` (`agent/_response.py`,
+    the CONSUMER layer) as the model streams. `run_output` is still built up
+    in place the same way (mutated by `handle_model_response_stream()`'s
+    trailing call to `update_run_response()`) - by the time the generator is
+    exhausted, `run_output` reflects the same finished state `run()`'s
+    return value would have, callers just also got to watch it happen.
+
+    Same exception handling shape as `run()`, translated into one terminal
+    event instead of one early `return`: `RunCancelledException` /
+    `ModelProviderError` raised out of the streaming sub-loop still leave
+    whatever rounds already ran sitting in `run_messages.messages` (same
+    partial-transcript decision `run()` makes), reported here as
+    `RunCancelledEvent`/`RunErrorEvent` instead of a `RunOutput.status`
+    the caller has to notice after the fact.
+
+    `RunStartedEvent` is yielded exactly once here, before anything else -
+    it marks "the run as a whole has begun," which is not the same thing as
+    `ModelRequestStartedEvent` (yielded once per iteration, inside
+    `handle_model_response_stream()` -> `response_stream()`): a run with a
+    tool-call round trip fires `ModelRequestStarted`/`ModelRequestCompleted`
+    twice (once per model turn) but `RunStartedEvent` only once, at the very
+    top.
+    """
+    run_id = str(uuid4())
+    session_id = session_id or str(uuid4())
+
+    run_messages = get_run_messages(agent=agent, input=input, session_history=session_history)
+
+    run_output = RunOutput(
+        run_id=run_id,
+        agent_id=agent.id,
+        agent_name=agent.name,
+        session_id=session_id,
+        user_id=user_id,
+        input=RunInput(input_content=input),
+        model=agent.model.id,
+        model_provider=agent.model.get_provider(),
+        status=RunStatus.running,
+    )
+
+    yield RunStartedEvent(
+        agent_id=agent.id,
+        agent_name=agent.name,
+        run_id=run_id,
+        session_id=session_id,
+        model=agent.model.id,
+        model_provider=agent.model.get_provider(),
+    )
+
+    functions = resolve_tools(agent) or None
+
+    timer = Timer()
+    timer.start()
+    try:
+        yield from handle_model_response_stream(
+            agent=agent,
+            run_output=run_output,
+            run_messages=run_messages,
+            functions=functions,
+        )
+    except RunCancelledException as e:
+        timer.stop()
+        logger.info(f"Run {run_id} cancelled: {e}")
+        run_output.status = RunStatus.cancelled
+        run_output.content = str(e)
+        run_output.messages = list(run_messages.messages)
+        yield RunCancelledEvent(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            run_id=run_id,
+            session_id=session_id,
+            content=str(e),
+        )
+        return
+    except ModelProviderError as e:
+        timer.stop()
+        logger.warning(f"Run {run_id} failed: {e}")
+        run_output.status = RunStatus.error
+        run_output.content = str(e)
+        run_output.messages = list(run_messages.messages)
+        yield RunErrorEvent(
+            agent_id=agent.id,
+            agent_name=agent.name,
+            run_id=run_id,
+            session_id=session_id,
+            content=str(e),
+        )
+        return
+    timer.stop()
+
+    if run_output.metrics is not None:
+        run_output.metrics.duration = timer.elapsed

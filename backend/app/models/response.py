@@ -24,10 +24,31 @@ directly rather than a bare `Timer` + hand-assigned `.duration`.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from time import time
 from typing import Any, Dict, List, Optional
 
 from app.metrics import MessageMetrics, ToolCallMetrics
+
+
+class ModelResponseEvent(str, Enum):
+    """Stage 4 addition: the lifecycle-marker vocabulary `response_stream()`
+    (`models/base.py`) yields alongside plain content deltas, mirroring
+    Agno's `agno/models/response.py` enum trimmed to the four events this
+    project's loop actually needs.
+
+    Trimmed out vs. real Agno: `tool_call_paused` (HITL - not built),
+    `compression_started`/`compression_completed` (compression manager -
+    not built), `fallback_model_activated` (fallback-model logic - not
+    built), `assistant_response` (real Agno's default `ModelResponse.event`
+    value for a plain content delta; this project uses `event=None` for
+    that instead - see `ModelResponse.event` below).
+    """
+
+    model_request_started = "ModelRequestStarted"
+    model_request_completed = "ModelRequestCompleted"
+    tool_call_started = "ToolCallStarted"
+    tool_call_completed = "ToolCallCompleted"
 
 
 @dataclass
@@ -71,7 +92,26 @@ class ToolExecution:
 @dataclass
 class ModelResponse:
     """One model call's response, as handed back to the agent loop by a
-    provider adapter."""
+    provider adapter.
+
+    Stage 4 addition: `event` plus four metrics fields, for `response_stream()`
+    (`models/base.py`). This is the envelope-plus-marker trick: the *same*
+    `ModelResponse` type is reused for two different things, discriminated
+    by whether `.event` is set -
+
+      - `event=None` (the default): this is a content delta - `.content`
+        (or `.tool_calls`, mid-accumulation) is the payload a consumer cares
+        about. This is what every non-streaming `ModelResponse` already
+        looked like, so `event=None` costs existing call sites nothing.
+      - `event=<ModelResponseEvent value>`: this instance carries no new
+        content: it's a notification that something happened
+        (`model_request_started`, `tool_call_completed`, ...). The four
+        metrics fields below are only ever populated on a
+        `model_request_completed` event.
+
+    A consumer iterating `response_stream()`'s output can dispatch with one
+    check: `if response.event: ... else: # content delta`.
+    """
 
     role: Optional[str] = None
 
@@ -90,6 +130,20 @@ class ModelResponse:
     created_at: int = field(default_factory=lambda: int(time()))
 
     extra: Optional[Dict[str, Any]] = None
+
+    # --- Stage 4: streaming lifecycle marker + its metrics payload ---
+    # None means "this is a content delta"; a ModelResponseEvent value means
+    # "this is a lifecycle notification, not new content" (see class
+    # docstring above).
+    event: Optional[str] = None
+
+    # Populated only on a model_request_completed event - lifted straight
+    # off the finished assistant_message.metrics at the point
+    # response_stream() emits that event.
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    time_to_first_token: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         _dict = asdict(self)

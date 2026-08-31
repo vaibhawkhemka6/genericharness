@@ -106,10 +106,27 @@ class BaseMetrics:
 
 @dataclass
 class MessageMetrics(BaseMetrics):
-    """Usage + timing for a single model response message."""
+    """Usage + timing for a single model response message.
+
+    Stage 4 addition: `timer`/`start_timer()`/`stop_timer()`/
+    `set_time_to_first_token()`. The non-streaming path never needed a timer
+    living *on* a `MessageMetrics` - `invoke()` just wraps a plain `Timer`
+    around the whole call and assigns `.duration` once, after the fact, when
+    the full response already exists. Streaming has no "after the fact": TTFT
+    is "how long since the timer started until the *first* chunk arrived",
+    measured mid-flight, so the timer has to be a field on the accumulator
+    itself (`MessageData.response_metrics`, `models/base.py`) rather than a
+    local the caller throws away.
+
+    `timer` is deliberately excluded from `to_dict()`/`from_dict()` - it's a
+    live `Timer` object, not serializable data, and has no meaning once a
+    run is done (unlike `duration`/`time_to_first_token`, the numbers it
+    produced along the way).
+    """
 
     duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
+    timer: Optional[Timer] = None
 
     def __add__(self, other: "MessageMetrics") -> "MessageMetrics":
         result = MessageMetrics(
@@ -130,19 +147,52 @@ class MessageMetrics(BaseMetrics):
             result.time_to_first_token = (
                 self.time_to_first_token if self.time_to_first_token is not None else other.time_to_first_token
             )
+
+        # Preserve `self`'s timer (not `other`'s) onto the result. This is
+        # what makes `stream_data.response_metrics += usage_delta`
+        # (models/base.py:_populate_stream_data) work as *in-place*
+        # accumulation even though MessageMetrics has no __iadd__: Python
+        # falls back to __add__ and reassigns, so the running timer that
+        # was already ticking on `stream_data.response_metrics` has to
+        # survive into the new object `+=` produces, or every usage-delta
+        # chunk would silently reset elapsed time back to zero.
+        result.timer = self.timer
         return result
 
+    def start_timer(self) -> None:
+        if self.timer is None:
+            self.timer = Timer()
+        self.timer.start()
+
+    def stop_timer(self, set_duration: bool = True) -> None:
+        if self.timer is not None:
+            self.timer.stop()
+            if set_duration:
+                self.duration = self.timer.elapsed
+
+    def set_time_to_first_token(self) -> None:
+        """Capture elapsed-since-start_timer() as TTFT - but only the first
+        time this is called. Guard is load-bearing: `_populate_stream_data`
+        calls this on *every* content chunk, not just the first, so without
+        the `is None` check TTFT would keep sliding forward to "time of the
+        most recent chunk" instead of staying pinned to the first one.
+        """
+        if self.timer is not None and self.time_to_first_token is None:
+            self.time_to_first_token = self.timer.elapsed
+
     def to_dict(self) -> Dict[str, Any]:
-        """Compact dict form - drops None and zero-valued fields."""
+        """Compact dict form - drops None and zero-valued fields, and the
+        live `timer` object (not serializable, not meaningful once a run
+        is done)."""
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if getattr(self, f.name) not in (None, 0)
+            if f.name != "timer" and getattr(self, f.name) not in (None, 0)
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "MessageMetrics":
-        known = {f.name for f in fields(cls)}
+        known = {f.name for f in fields(cls)} - {"timer"}
         return cls(**{k: v for k, v in data.items() if k in known})
 
 
