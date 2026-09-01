@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
 from uuid import uuid4
 
+from app.db.base import Db
 from app.models.base import Model
 from app.models.message import Message
 from app.tools.function import Function
@@ -66,10 +67,18 @@ class Agent:
     tools: Optional[List[Union[Callable, Function, Toolkit]]] = None
     tool_call_limit: Optional[int] = None
 
-    # Stub standing in for session/db (Stage 5): a plain list the caller
+    # Stage 5 addition: the real session/db backend. None (default) keeps
+    # every earlier stage's behavior exactly as it was - get_run_messages()
+    # falls back to the session_history stub below whenever this is unset,
+    # rather than requiring a db to run at all.
+    db: Optional[Db] = None
+
+    # Pre-Stage-5 stub standing in for session/db: a plain list the caller
     # hands in (or sets here) rather than something Agent.run() fetches
-    # from a real store. get_run_messages() reads this when the caller
-    # doesn't pass session_history explicitly to run().
+    # from a real store. get_run_messages() reads this only when `db` is
+    # None (or the caller passes an explicit session_history override) -
+    # once `db` is set, real session history (loaded via
+    # agent/_storage.py:read_or_create_session()) takes over instead.
     session_history: Optional[List[Message]] = None
     num_history_messages: Optional[int] = None
 

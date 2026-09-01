@@ -4,7 +4,7 @@ input into the `RunMessages` `Model.response()` will mutate in place.
 Three pieces, run in a fixed order by `get_run_messages()`:
 
     get_system_message()             agent.description + agent.instructions -> one system Message
-    get_session_history_messages()   a session-history stub (Stage 5 replaces this with a real lookup)
+    get_session_history_messages()   session-backed history lookup (Stage 5) or the pre-Stage-5 stub
     get_user_message()               raw run() input -> one user Message
 
 Trimmed against real Agno's `Agent.get_system_message()`/`get_user_message()`
@@ -15,18 +15,29 @@ functions taking `agent` as a parameter rather than methods on `Agent` -
 same reasoning as `models/*/chat.py`'s translation functions: lets a future
 stage script call `get_system_message(agent)` directly, by hand, without
 needing a live `Agent.run()` to exercise it.
+
+Stage 5 addition: `get_session_history_messages()`/`get_run_messages()` both
+gained an optional `session` parameter (an `AgentSession`,
+`session/agent.py`) - when `_run.py` has one (i.e. `agent.db` is
+configured), history comes from `session.get_messages()` instead of the
+`agent.session_history` stub. See `get_session_history_messages()`'s own
+docstring for the exact precedence between an explicit `session_history`
+override, a real `session`, and the stub.
 """
 
 from __future__ import annotations
 
 import json
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from pydantic import BaseModel
 
 from app.agent.agent import Agent
 from app.models.message import Message
 from app.run.messages import RunMessages
+
+if TYPE_CHECKING:
+    from app.session.agent import AgentSession
 
 
 def get_system_message(agent: Agent) -> Optional[Message]:
@@ -78,18 +89,35 @@ def get_user_message(input: Union[str, List, Dict, Message, BaseModel]) -> Optio
 
 def get_session_history_messages(
     agent: Agent,
+    session: Optional["AgentSession"] = None,
     session_history: Optional[List[Message]] = None,
 ) -> List[Message]:
-    """Stand-in for a real session/db history lookup (Stage 5 - `session/`,
-    `db/` don't exist yet). `session_history` is just a plain list the
-    caller already has in memory - falls back to `agent.session_history`
-    (itself just a stub field, see `agent.py`) if the caller doesn't pass
-    one - then trims to the last `agent.num_history_messages`, if set.
+    """Three-way precedence, in order:
 
-    Always returns a list, never `None` - `get_run_messages()` extends
-    directly with this, it shouldn't have to null-check it.
+      1. `session_history` - an explicit override the caller passed
+         straight to `run()`/`get_run_messages()`. Wins over everything,
+         same as before Stage 5.
+      2. `session` - a real `AgentSession` (Stage 5, `session/agent.py`),
+         present whenever `agent.db` is configured - `read_or_create_session()`
+         (`agent/_storage.py`) is what `_run.py` builds this from before
+         calling here. History comes from `session.get_messages()`, which
+         already applies its own error/cancelled-run filtering (see that
+         method's docstring).
+      3. `agent.session_history` - the pre-Stage-5 stub, still exactly what
+         it always was: a plain list the caller hands in once, for agents
+         that don't want a real `db` at all.
+
+    Whichever list wins then trims to the last `agent.num_history_messages`,
+    if set. Always returns a list, never `None` - `get_run_messages()`
+    extends directly with this, it shouldn't have to null-check it.
     """
-    history = session_history if session_history is not None else agent.session_history
+    if session_history is not None:
+        history: List[Message] = session_history
+    elif session is not None:
+        history = session.get_messages()
+    else:
+        history = agent.session_history or []
+
     if not history:
         return []
     if agent.num_history_messages is not None:
@@ -100,6 +128,7 @@ def get_session_history_messages(
 def get_run_messages(
     agent: Agent,
     input: Union[str, List, Dict, Message, BaseModel, List[Message]],
+    session: Optional["AgentSession"] = None,
     session_history: Optional[List[Message]] = None,
 ) -> RunMessages:
     """The 4-step assembler: system -> history -> user -> done.
@@ -129,7 +158,7 @@ def get_run_messages(
 
     run_messages.system_message = get_system_message(agent)
 
-    history = get_session_history_messages(agent=agent, session_history=session_history)
+    history = get_session_history_messages(agent=agent, session=session, session_history=session_history)
     run_messages.extra_messages = history or None
 
     if isinstance(input, list) and input and all(isinstance(item, Message) for item in input):

@@ -4,25 +4,34 @@ wants, assemble `messages` via `get_run_messages()` (Half B's message-
 building piece), make the one call into Half A (`agent.model.response()`),
 and turn the result into a `RunOutput` via `update_run_response()`.
 
-Trimmed against real Agno's `Agent._run()`/`Agent.arun()`: no streaming, no
-session read-then-write-back (session_history is a stub the caller hands
-in - see `agent.py`'s docstring), no hooks, no reasoning, no output
-schema/parser model, no HITL pause/resume. Just: build the messages, call
-the model, report what happened - including when the model call itself
-fails, which is the one place this function has to do more than wire
-Half A and Half B together.
+Trimmed against real Agno's `Agent._run()`/`Agent.arun()`: no hooks, no
+reasoning, no output schema/parser model, no HITL pause/resume. Just: build
+the messages, call the model, report what happened - including when the
+model call itself fails, which is the one place this function has to do
+more than wire Half A and Half B together.
+
+Stage 5 addition: session read-then-write-back, via two one-line bookends
+around the same core - `read_or_create_session()` (`agent/_storage.py`)
+before `get_run_messages()` so history can flow in, and `_cleanup_and_store()`
+(this module, below) on every terminal path - success, cancelled, and
+error alike - so the run flows back out. Both are no-ops when `agent.db`
+isn't set (`read_or_create_session()` returns `None`, `_cleanup_and_store()`
+sees that `None` and does nothing), so an agent without a `db` runs exactly
+as it did before this stage.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, Iterator, List, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel
 
 from app.agent._messages import get_run_messages
 from app.agent._response import handle_model_response_stream, update_run_response
+from app.agent._session import save_session
+from app.agent._storage import read_or_create_session
 from app.agent.agent import Agent
 from app.exceptions import ModelProviderError, RunCancelledException
 from app.metrics import Timer
@@ -32,7 +41,29 @@ from app.run.base import RunStatus
 from app.tools.function import Function
 from app.tools.toolkit import Toolkit
 
+if TYPE_CHECKING:
+    from app.session.agent import AgentSession
+
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_and_store(agent: Agent, session: Optional["AgentSession"], run_output: RunOutput) -> None:
+    """Terminal-path bookend, called once from every exit point of `run()`
+    and `run_stream()` (success, cancelled, error alike - matching the
+    "persist everything, filter bad runs out of future context" decision
+    `AgentSession.get_messages()` enforces on the read side). Appends
+    `run_output` to `session` (dedup-by-`run_id`-or-append, see
+    `AgentSession.upsert_run()`) and writes it back via `save_session()`.
+
+    No-op when `session` is `None` - the exact signal `read_or_create_session()`
+    returns when `agent.db` isn't configured, so a databaseless `Agent` takes
+    this call and does nothing, unaffected by Stage 5 same as everywhere else
+    in this module.
+    """
+    if session is None:
+        return
+    session.upsert_run(run_output)
+    save_session(agent, session)
 
 
 def resolve_tools(agent: Agent) -> Dict[str, Function]:
@@ -74,7 +105,9 @@ def run(
     run_id = str(uuid4())
     session_id = session_id or str(uuid4())
 
-    run_messages = get_run_messages(agent=agent, input=input, session_history=session_history)
+    session = read_or_create_session(agent, session_id, user_id)
+
+    run_messages = get_run_messages(agent=agent, input=input, session=session, session_history=session_history)
 
     run_output = RunOutput(
         run_id=run_id,
@@ -103,16 +136,16 @@ def run(
         # mutates run_messages.messages in place as it goes, so whatever
         # rounds completed before cancellation are already sitting there -
         # a cancelled run still hands back everything that happened up to
-        # the cut, rather than losing it silently. Whether a *session/db*
-        # layer later chooses to write an errored/cancelled run's messages
-        # to storage is that layer's call to make (Stage 5), not this
-        # function's - RunOutput.status is exactly the signal it needs to
-        # decide that.
+        # the cut, rather than losing it silently. Stage 5: the run is still
+        # persisted as-is (status=cancelled) via _cleanup_and_store() below -
+        # AgentSession.get_messages()'s skip_statuses is what keeps it out of
+        # *future* context, not a decision made here about whether to save it.
         timer.stop()
         logger.info(f"Run {run_id} cancelled: {e}")
         run_output.status = RunStatus.cancelled
         run_output.content = str(e)
         run_output.messages = list(run_messages.messages)
+        _cleanup_and_store(agent, session, run_output)
         return run_output
     except ModelProviderError as e:
         timer.stop()
@@ -120,12 +153,14 @@ def run(
         run_output.status = RunStatus.error
         run_output.content = str(e)
         run_output.messages = list(run_messages.messages)
+        _cleanup_and_store(agent, session, run_output)
         return run_output
     timer.stop()
 
     update_run_response(run_output=run_output, model_response=model_response, run_messages=run_messages)
     if run_output.metrics is not None:
         run_output.metrics.duration = timer.elapsed
+    _cleanup_and_store(agent, session, run_output)
     return run_output
 
 
@@ -165,7 +200,9 @@ def run_stream(
     run_id = str(uuid4())
     session_id = session_id or str(uuid4())
 
-    run_messages = get_run_messages(agent=agent, input=input, session_history=session_history)
+    session = read_or_create_session(agent, session_id, user_id)
+
+    run_messages = get_run_messages(agent=agent, input=input, session=session, session_history=session_history)
 
     run_output = RunOutput(
         run_id=run_id,
@@ -205,6 +242,7 @@ def run_stream(
         run_output.status = RunStatus.cancelled
         run_output.content = str(e)
         run_output.messages = list(run_messages.messages)
+        _cleanup_and_store(agent, session, run_output)
         yield RunCancelledEvent(
             agent_id=agent.id,
             agent_name=agent.name,
@@ -219,6 +257,7 @@ def run_stream(
         run_output.status = RunStatus.error
         run_output.content = str(e)
         run_output.messages = list(run_messages.messages)
+        _cleanup_and_store(agent, session, run_output)
         yield RunErrorEvent(
             agent_id=agent.id,
             agent_name=agent.name,
@@ -231,3 +270,4 @@ def run_stream(
 
     if run_output.metrics is not None:
         run_output.metrics.duration = timer.elapsed
+    _cleanup_and_store(agent, session, run_output)
