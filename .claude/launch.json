@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "agentos-frontend",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["/Users/vaibhawkhemka/Desktop/wind/libs/run_frontend.py"],
+      "port": 3000
+    }
+  ]
+}
